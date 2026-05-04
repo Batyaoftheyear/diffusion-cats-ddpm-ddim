@@ -1,0 +1,12 @@
+torch
+torchvision
+diffusers
+datasets
+accelerate
+transformers
+matplotlib
+pandas
+tqdm
+pyyaml
+pillow
+huggingface_hub

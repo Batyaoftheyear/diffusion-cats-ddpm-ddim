@@ -1,16 +1,26 @@
 dataset_name: "huggan/few-shot-cat"
 image_size: 64
+in_channels: 3
+out_channels: 3
+layers_per_block: 2
+block_out_channels: [64, 128, 128, 256]
+down_block_types: ["DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"]
+up_block_types: ["UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D"]
 train_batch_size: 16
 eval_batch_size: 16
-num_epochs: 50
+num_epochs: 300
 learning_rate: 0.0001
 gradient_accumulation_steps: 1
 lr_warmup_steps: 500
 num_train_timesteps: 1000
 beta_schedule: "linear"
+prediction_type: "epsilon"
+eval_inference_steps: 200
+ddpm_default_steps: 1000
+ddim_default_steps: 100
 mixed_precision: "fp16"
 seed: 0
-save_image_epochs: 5
+save_image_epochs: 20
 save_model_epochs: 10
 output_dir: "./outputs"
 num_workers: 2

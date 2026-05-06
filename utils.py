@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import torch
 import yaml
@@ -28,6 +29,10 @@ def ensure_dir(path):
 
 
 def tensor_to_uint8(images: torch.Tensor) -> torch.Tensor:
+    if isinstance(images, np.ndarray):
+        images = torch.from_numpy(images)
+        if images.ndim == 4 and images.shape[-1] in (1, 3):
+            images = images.permute(0, 3, 1, 2)
     if images.min() < 0 or images.max() > 1:
         images = (images.clamp(-1, 1) + 1) / 2
     else:

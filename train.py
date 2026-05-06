@@ -6,12 +6,13 @@ import torch.nn.functional as F
 import yaml
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel
+from diffusers import DDPMPipeline, DDPMScheduler
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from torch.optim import AdamW
 from tqdm.auto import tqdm
 
 from dataset import get_dataloader
+from models import build_model
 from utils import (
     append_train_log,
     ensure_dir,
@@ -34,40 +35,20 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_model(image_size: int):
-    return UNet2DModel(
-        sample_size=image_size,
-        in_channels=3,
-        out_channels=3,
-        layers_per_block=2,
-        block_out_channels=(64, 128, 128, 256),
-        down_block_types=(
-            "DownBlock2D",
-            "DownBlock2D",
-            "AttnDownBlock2D",
-            "DownBlock2D",
-        ),
-        up_block_types=(
-            "UpBlock2D",
-            "AttnUpBlock2D",
-            "UpBlock2D",
-            "UpBlock2D",
-        ),
-    )
-
-
 def create_preview(unwrapped_model, config, output_dir, epoch, device):
     preview_scheduler = DDPMScheduler(
         num_train_timesteps=config["num_train_timesteps"],
         beta_schedule=config["beta_schedule"],
+        prediction_type=config["prediction_type"],
     )
     pipeline = DDPMPipeline(unet=unwrapped_model, scheduler=preview_scheduler)
     pipeline = pipeline.to(device)
     generator = torch.Generator(device=device).manual_seed(config["seed"] + epoch)
+    unwrapped_model.eval()
     images = pipeline(
         batch_size=config["preview_num_images"],
         generator=generator,
-        num_inference_steps=config["num_train_timesteps"],
+        num_inference_steps=config["eval_inference_steps"],
         output_type="pt",
     ).images
     sample_path = Path(output_dir) / "samples" / f"epoch_{epoch:03d}.png"
@@ -99,18 +80,24 @@ def main():
     if config.get("seed") is not None:
         set_seed(config["seed"])
 
-    dataloader = get_dataloader(
+    raw_dataloader = get_dataloader(
         dataset_name=config["dataset_name"],
         image_size=config["image_size"],
         batch_size=config["train_batch_size"],
         shuffle=True,
         num_workers=config.get("num_workers", 0),
     )
+    dataset_size = len(raw_dataloader.dataset)
+    first_batch = next(iter(raw_dataloader))
+    pixel_min = first_batch["pixel_values"].min().item()
+    pixel_max = first_batch["pixel_values"].max().item()
 
-    model = build_model(config["image_size"])
+    model = build_model(config=config)
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
     noise_scheduler = DDPMScheduler(
         num_train_timesteps=config["num_train_timesteps"],
         beta_schedule=config["beta_schedule"],
+        prediction_type=config["prediction_type"],
     )
 
     optimizer = AdamW(
@@ -121,15 +108,23 @@ def main():
         eps=config["adam_epsilon"],
     )
 
-    total_train_steps = len(dataloader) * config["num_epochs"]
+    total_train_steps = len(raw_dataloader) * config["num_epochs"]
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=config["lr_warmup_steps"],
         num_training_steps=total_train_steps,
     )
 
-    model, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, dataloader, lr_scheduler
+    if accelerator.is_main_process:
+        print(f"Device: {accelerator.device}")
+        print(f"Dataset size: {dataset_size}")
+        print(f"Image tensor range after preprocessing: min={pixel_min:.4f}, max={pixel_max:.4f}")
+        print(f"Model parameter count: {parameter_count}")
+        print(f"Training timesteps: {config['num_train_timesteps']}")
+        print(f"Preview inference steps: {config['eval_inference_steps']}")
+
+    model, optimizer, raw_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, raw_dataloader, lr_scheduler
     )
 
     best_loss = float("inf")
@@ -147,7 +142,7 @@ def main():
         epoch_loss_count = 0
         epoch_rows = []
 
-        for step, batch in enumerate(dataloader, start=1):
+        for step, batch in enumerate(raw_dataloader, start=1):
             clean_images = batch["pixel_values"]
             noise = torch.randn_like(clean_images)
             batch_size = clean_images.shape[0]
@@ -202,6 +197,7 @@ def main():
                 epoch,
                 best_loss=min(best_loss, mean_epoch_loss),
             )
+            print(f"Saved checkpoint: {output_dir / 'checkpoints' / 'last.pt'}")
 
             if mean_epoch_loss < best_loss:
                 best_loss = mean_epoch_loss
@@ -212,6 +208,7 @@ def main():
                     epoch,
                     best_loss=best_loss,
                 )
+                print(f"Saved checkpoint: {output_dir / 'checkpoints' / 'best.pt'}")
 
             if epoch % config["save_model_epochs"] == 0:
                 save_checkpoint(
@@ -221,6 +218,7 @@ def main():
                     epoch,
                     best_loss=best_loss,
                 )
+                print(f"Saved checkpoint: {output_dir / 'checkpoints' / f'epoch_{epoch:03d}.pt'}")
 
             if epoch % config["save_image_epochs"] == 0 or epoch == config["num_epochs"]:
                 create_preview(
@@ -230,6 +228,7 @@ def main():
                     epoch=epoch,
                     device=accelerator.device,
                 )
+                print(f"Saved preview: {output_dir / 'samples' / f'epoch_{epoch:03d}.png'}")
 
         accelerator.wait_for_everyone()
 
